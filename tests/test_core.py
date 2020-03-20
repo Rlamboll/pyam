@@ -1,4 +1,3 @@
-import os
 import logging
 import pytest
 import re
@@ -12,7 +11,7 @@ from pyam import IamDataFrame, validate, categorize, \
     require_variable, filter_by_meta, META_IDX, IAMC_IDX, sort_data, compare
 from pyam.core import _meta_idx, concat
 
-from conftest import TEST_DATA_DIR, TEST_DTS
+from conftest import TEST_DTS
 
 
 df_filter_by_meta_matching_idx = pd.DataFrame([
@@ -29,6 +28,16 @@ df_filter_by_meta_nonmatching_idx = pd.DataFrame([
 ], columns=['model', 'scenario', 'region', 2010, 2020]
 ).set_index(['model', 'region'])
 
+df_with_na_columns = pd.DataFrame([
+    ['model_a', 'scen_a', 'World', 'Primary Energy', np.nan, 1, 6.],
+    ['model_a', 'scen_a', 'World', 'Primary Energy|Coal', 'EJ/yr', 0.5, 3],
+    ['model_a', 'scen_b', 'World', 'Primary Energy', 'EJ/yr', 2, 7],
+],
+    columns=IAMC_IDX + [2005, 2010],
+)
+
+df_empty = pd.DataFrame([], columns=IAMC_IDX + [2005, 2010])
+
 
 def test_init_df_with_index(test_pd_df):
     df = IamDataFrame(test_pd_df.set_index(META_IDX))
@@ -44,6 +53,10 @@ def test_init_df_with_duplicates_raises(test_df):
     _df = test_df.timeseries()
     _df = _df.append(_df.iloc[0]).reset_index()
     pytest.raises(ValueError, IamDataFrame, data=_df)
+
+
+def test_init_df_with_na_unit(test_df):
+    pytest.raises(ValueError, IamDataFrame, data=df_with_na_columns)
 
 
 def test_init_df_with_float_cols(test_pd_df):
@@ -138,15 +151,9 @@ def test_init_datetime_subclass_long_timespan(test_pd_df):
 
 
 def test_init_empty_message(test_pd_df, caplog):
-    tdf = test_pd_df.copy()
-    tdf["extra_col"] = "test_val"
-    tdf["extra_col"] = np.nan
-
-    res = IamDataFrame(tdf)
-    assert "Primary Energy|Coal" not in res.variables().tolist()
-
+    IamDataFrame(data=df_empty)
     drop_message = (
-        "Formatted data is empty! (perhaps there is a column full of nans?)"
+        "Formatted data is empty!"
     )
     message_idx = caplog.messages.index(drop_message)
     assert caplog.records[message_idx].levelno == logging.WARNING
@@ -207,16 +214,14 @@ def test_variable(test_df):
 
 def test_variable_unit(test_df):
     dct = {'variable': ['Primary Energy', 'Primary Energy|Coal'],
-           'unit': ['EJ/y', 'EJ/y']}
+           'unit': ['EJ/yr', 'EJ/yr']}
     exp = pd.DataFrame.from_dict(dct)[['variable', 'unit']]
     npt.assert_array_equal(test_df.variables(include_units=True), exp)
 
 
 def test_filter_empty_df():
     # test for issue seen in #254
-    cols = IAMC_IDX + [2005, 2010]
-    data = pd.DataFrame([], columns=cols)
-    df = IamDataFrame(data=data)
+    df = IamDataFrame(data=df_empty)
     obs = df.filter(variable='foo')
     assert len(obs) == 0
 
@@ -542,6 +547,31 @@ def test_require_variable_top_level(test_df):
     assert list(test_df['exclude']) == [False, True]
 
 
+def test_require_variable_year_list(test_df):
+    years = [2005, 2010]
+
+    # checking for variables that have ANY of the years in the list
+    df = IamDataFrame(test_df.data[1:])
+    df.require_variable(variable='Primary Energy',
+                        year=years,
+                        exclude_on_fail=True)
+    df.filter(exclude=False, inplace=True)
+
+    assert len(df.variables()) == 2
+    assert len(df.scenarios()) == 2
+
+    # checking for variables that have ALL of the years in the list
+    df = IamDataFrame(test_df.data[1:])
+    for y in years:
+        df.require_variable(variable='Primary Energy',
+                            year=y,
+                            exclude_on_fail=True)
+    df.filter(exclude=False, inplace=True)
+
+    assert len(df.variables()) == 1
+    assert len(df.scenarios()) == 1
+
+
 def test_validate_all_pass(test_df):
     obs = test_df.validate(
         {'Primary Energy': {'up': 10}}, exclude_on_fail=True)
@@ -666,6 +696,22 @@ def test_interpolate(test_df_year):
     # redo the interpolation and check that no duplicates are added
     test_df_year.interpolate(2007)
     assert not test_df_year.filter().data.duplicated().any()
+
+
+def test_interpolate_datetimes(test_df):
+    # test that interpolation also works with date-times.
+    some_date = datetime.datetime(2007, 7, 1)
+    if test_df.time_col == "year":
+        pytest.raises(ValueError, test_df.interpolate, time=some_date)
+    else:
+        test_df.interpolate(some_date)
+        obs = test_df.filter(time=some_date).data['value']\
+            .reset_index(drop=True)
+        exp = pd.Series([3, 1.5, 4], name='value')
+        pd.testing.assert_series_equal(obs, exp, check_less_precise=True)
+        # redo the interpolation and check that no duplicates are added
+        test_df.interpolate(some_date)
+        assert not test_df.filter().data.duplicated().any()
 
 
 def test_filter_by_bool(test_df):

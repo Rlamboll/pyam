@@ -50,6 +50,7 @@ from pyam.utils import (
 from pyam.read_ixmp import read_ix
 from pyam.timeseries import fill_series
 from pyam._aggregate import _aggregate, _aggregate_region, _group_and_agg
+from pyam.units import convert_unit, convert_unit_with_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -251,7 +252,7 @@ class IamDataFrame(object):
         if self.time_col is not other.time_col:
             raise ValueError('incompatible time format (years vs. datetime)!')
 
-        ret = copy.deepcopy(self) if not inplace else self
+        ret = self.copy() if not inplace else self
 
         diff = other.meta.index.difference(ret.meta.index)
         intersect = other.meta.index.intersection(ret.meta.index)
@@ -343,24 +344,28 @@ class IamDataFrame(object):
                             aggfunc=aggfunc, fill_value=fill_value)
         return df
 
-    def interpolate(self, year):
+    def interpolate(self, time):
         """Interpolate missing values in timeseries (linear interpolation)
 
         Parameters
         ----------
-        year: int
-             year to be interpolated
+        time: int, datetime
+             Time or year to be interpolated. This must match the
+             date-time/year style of self.
         """
-        df = self.pivot_table(index=IAMC_IDX, columns=['year'],
+        if self.time_col == 'year' and not isinstance(time, int):
+            raise ValueError(
+                'The `time` argument `{}` is not an integer'.format(time)
+            )
+        df = self.pivot_table(index=IAMC_IDX, columns=[self.time_col],
                               values='value', aggfunc=np.sum)
-        # drop year-rows where values are already defined
-        if year in df.columns:
-            df = df[np.isnan(df[year])]
-        fill_values = df.apply(fill_series,
-                               raw=False, axis=1, year=year)
+        # drop time-rows where values are already defined
+        if time in df.columns:
+            df = df[np.isnan(df[time])]
+        fill_values = df.apply(fill_series, raw=False, axis=1, time=time)
         fill_values = fill_values.dropna().reset_index()
         fill_values = fill_values.rename(columns={0: "value"})
-        fill_values['year'] = year
+        fill_values[self.time_col] = time
         self.data = self.data.append(fill_values, ignore_index=True)
 
     def swap_time_for_year(self, inplace=False):
@@ -604,7 +609,7 @@ class IamDataFrame(object):
         unit: str, default None
             name of unit (optional)
         year: int or list, default None
-            years (optional)
+            check whether the variable exists for ANY of the years (if a list)
         exclude_on_fail: bool, default False
             flag scenarios missing the required variables as `exclude: True`
         """
@@ -714,7 +719,7 @@ class IamDataFrame(object):
             return self.append(df.rename(mapping), inplace=inplace)
 
         # if append is False, iterate over rename mapping and do groupby
-        ret = copy.deepcopy(self) if not inplace else self
+        ret = self.copy() if not inplace else self
 
         # renaming is only applied where a filter matches for all given columns
         rows = ret._apply_filters(**filters)
@@ -753,26 +758,50 @@ class IamDataFrame(object):
         if not inplace:
             return ret
 
-    def convert_unit(self, conversion_mapping, inplace=False):
-        """Converts units based on provided unit conversion factors
+    def convert_unit(self, current, to=None, factor=None, registry=None,
+                     context=None, inplace=False):
+        """Converts a unit using a given factor or the pint package
+
+        The `pint package <https://pint.readthedocs.io>`_ natively handles
+        conversion of standard (SI) units (e.g., exajoule to terawatt-hours,
+        :code:`EJ -> TWh`). It can also parse combined units (e.g.,
+        exajoule per year, :code:`EJ/yr`).
+
+        The :py:class:`pint.UnitRegistry` used by default loads additional
+        unit definitions relevant for integrated assessment models and energy
+        systems analysis from the `IAMconsortium/units
+        <https://github.com/IAMconsortium/units>`_ repository.
+
+        You can access the :py:class:`pint.UnitRegistry` used as default
+        by :class:`pyam` via :func:`pint.get_application_registry`.
 
         Parameters
         ----------
-        conversion_mapping: dict
-            for each unit for which a conversion should be carried out,
-            provide current unit and target unit and conversion factor
-            {<current unit>: [<target unit>, <conversion factor>]}
+        current: str (or mapping, deprecated)
+            name of current unit (to be converted from)
+        to: str
+            name of new unit (to be converted to)
+        factor: value, optional
+            conversion factor if given, otherwise defaults to the application
+            :py:class:`pint.UnitRegistry`
+        registry: pint.UnitRegistry, optional
+            use a specific UnitRegistry; if `None`, use default application
+            registry with definitions imported from the `IAMconsortium/units
+            <https://github.com/IAMconsortium/units>`_ repository
+        context: str, optional
+            passed to the pint.UnitRegistry
         inplace: bool, default False
             if True, do operation inplace and return None
         """
-        ret = copy.deepcopy(self) if not inplace else self
-        for current_unit, (new_unit, factor) in conversion_mapping.items():
-            factor = pd.to_numeric(factor)
-            where = ret.data['unit'] == current_unit
-            ret.data.loc[where, 'value'] *= factor
-            ret.data.loc[where, 'unit'] = new_unit
-        if not inplace:
-            return ret
+        # TODO: deprecate using `dict` in next release (>=0.6.0)
+        # TODO: make `to` required
+        if isinstance(current, dict) and to is None and factor is None:
+            deprecation_warning('Use explicit keyword arguments instead!',
+                                type='Using a dictionary to convert units')
+            return convert_unit_with_mapping(self, current, inplace)
+        # new standard method, remove this comment when deprecating above
+        return convert_unit(self, current, to, factor, registry, context,
+                            inplace)
 
     def normalize(self, inplace=False, **kwargs):
         """Normalize data to a specific data point
@@ -787,7 +816,7 @@ class IamDataFrame(object):
         """
         if len(kwargs) > 1 or self.time_col not in kwargs:
             raise ValueError('Only time(year)-based normalization supported')
-        ret = copy.deepcopy(self) if not inplace else self
+        ret = self.copy() if not inplace else self
         df = ret.data
         # change all below if supporting more in the future
         cols = self.time_col
@@ -1116,7 +1145,7 @@ class IamDataFrame(object):
 
         _keep = self._apply_filters(**kwargs)
         _keep = _keep if keep else ~_keep
-        ret = copy.deepcopy(self) if not inplace else self
+        ret = self.copy() if not inplace else self
         ret.data = ret.data[_keep]
 
         idx = _make_index(ret.data)
@@ -1509,7 +1538,7 @@ class IamDataFrame(object):
         mapping = read_pandas(fname).rename(str.lower, axis='columns')
         map_col = map_col.lower()
 
-        ret = copy.deepcopy(self) if not inplace else self
+        ret = self.copy() if not inplace else self
         _df = ret.data
         columns_orderd = _df.columns
 
@@ -1809,7 +1838,7 @@ def concat(dfs):
     for df in dfs:
         df = df if isinstance(df, IamDataFrame) else IamDataFrame(df)
         if _df is None:
-            _df = copy.deepcopy(df)
+            _df = df.copy()
         else:
             _df.append(df, inplace=True)
     return _df
